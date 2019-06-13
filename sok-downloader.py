@@ -1,16 +1,27 @@
 __author__ = 'Nicholas McKinney'
 
-import requests
-import logging
-import json
-import os
 import argparse
+import getpass
+import json
+import logging
+import os
+import requests
+import time
+import traceback
+
+
 from bs4 import BeautifulSoup
 
-Defcon = "Defcon"
-BSidesLV = "BSidesLV"
-AllowedChoices = (Defcon, BSidesLV)
-Conferences = {Defcon: 32, BSidesLV: 39}
+ConferenceIds = {
+    "DEFCON24": 32,
+    "DEFCON25": 41,
+    "DEFCON26": 54,
+    "DEFCON26-VILLAGE": 67,
+    "BSidesLV2016": 39,
+    "BlackHatUSA2017": 40,
+    "BlackHatUSA2018": 53,
+}
+AllowedChoices = ConferenceIds.keys()
 
 PLAYLIST_URL = "https://www.sok-media.com/player?action=get_playlist&conf_id={conference}"
 VIDEO_URL = "https://www.sok-media.com/player?session_id={video}&action=get_video"
@@ -35,24 +46,28 @@ class Content:
 
     @property
     def name(self):
-        return self.name
+        return self._name
 
     @name.setter
     def name(self, value):
-        self.name = value
+        self._name = value
 
 
 class Client:
-    def __init__(self, username, password):
+    def __init__(self, username, password, directory, delay, debug=False):
         self._username = username
         self._password = password
+        self._directory = directory
+        self._delay = delay
+        self._debug = debug
         self._session = requests.Session()
+        self._cookies = None
 
     def login(self):
         r = self._session.get(BASE_URL)
         if self.failed(r):
             logger.error("[*] Failed to access login page")
-            raise Exception("Failed connection")
+            raise ValueError("Failed connection")
         soup = BeautifulSoup(r.content, 'html.parser')
         div = soup.find(id="page_container")
         inputs = div.find_all("input", type="hidden")
@@ -65,28 +80,34 @@ class Client:
             payload[input.attrs['name']] = input.attrs['value']
         r = requests.post(LOGIN_URL, data=payload, headers={'Content-Type': 'application/x-www-form-urlencoded'})
         if len(r.history):
-            return requests.utils.dict_from_cookiejar(r.history[0].cookies)
+            cookies = requests.utils.dict_from_cookiejar(r.history[0].cookies)
+            self._cookies = cookies
+            return self._cookies
+        raise ValueError("Unable to login")
 
-    def get_video(self, video, directory, cookies=None):
-        logger.info("[*] Downloading video: %s" % video.name)
-        r = self._session.get(VIDEO_URL.format(video=video.id), cookies=cookies)
-        if self.failed(r):
-            logger.error("[*] Failed to get download URL: {title}".format(title=video.name))
+    def get_video(self, video):
+        if self._cookies is None:
+            raise ValueError("Must login 1st")
+        logger.info("[*] Downloading video: %s", video.name)
+        video_filename = video.name.replace("/", "") + '.mp4'
+        dl_path = os.path.join(self._directory, video_filename)
+        if os.path.exists(dl_path):
+            logger.warning("[!] Video %s already exists. Skipping...", video_filename)
             return
-        content = json.loads(r.content)
+        r = self._session.get(VIDEO_URL.format(video=video.id), cookies=self._cookies)
+        if self.failed(r):
+            logger.error("[!] Failed to get download URL for: {title}".format(title=video.name))
+            return
+        content = json.loads(r.content.decode("utf8"))
+        logger.info("[v] Download URL (only works for ~3hr): %s", content['url'])
         stream = self._session.get(content['url'], stream=True)
         if self.failed(stream):
-            logger.error("[*] Failed to get stream for: {title}".format(title=video.name))
+            logger.error("[!] Failed to get stream for: {title}".format(title=video.name))
             return
-        dl_path = os.path.join(directory, video.name.replace("/","")+'.mp4')
-        if os.path.exists(dl_path):
-            logger.warning("[*] Video %s already exists. Skipping..." % video.name)
-            return
-        with open(dl_path, 'wb') as f:
+        with open(dl_path, 'wb') as fh:
             for chunk in stream.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-        logger.info("[*] Downloaded video: %s" % video.name)
+                fh.write(chunk)
+        logger.info("[*] Downloaded video: %s to %s", video.name, dl_path)
         return dl_path
 
     def _make_vid(self, d):
@@ -95,13 +116,18 @@ class Client:
         c.name = d['sess_data']['session_name']
         return c
 
-    def get_playlist(self, conference, cookies=None):
+    def get_playlist(self, conference):
+        if self._cookies is None:
+            raise ValueError("Must login 1st")
         logger.info("[*] Getting playlist videos for {conference}".format(conference=conference.name))
-        r = self._session.get(PLAYLIST_URL.format(conference=conference.id), cookies=cookies)
+        r = self._session.get(PLAYLIST_URL.format(conference=conference.id), cookies=self._cookies)
         if self.failed(r):
-            logger.error("[*] Failed to get video playlist information for {conference}".format(conference=conference.name))
+            logger.error("[!] Failed to get video playlist information for {conference}".format(conference=conference.name))
             return
-        content = json.loads(r.content)
+        content = json.loads(r.content.decode('utf8'))
+        if self._debug:
+            with open(os.path.join(self._directory, "playlist.json"), "w") as fh:
+                json.dump(content, fh, indent=2)
         videos = [self._make_vid(d) for d in content['data']]
         logger.info('[*] Retrieved %d videos from conference %s' % (len(videos), conference.name))
         return videos
@@ -112,19 +138,50 @@ class Client:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('conference', choices=AllowedChoices)
-    parser.add_argument('outpath')
+    parser.add_argument('conferences', choices=AllowedChoices, nargs="+")
+    parser.add_argument('output_dir')
     parser.add_argument('username')
-    parser.add_argument('password')
+    parser.add_argument("-d", "--delay", type=int, default=5,
+            help="Delay between video downloads in seconds (default 5)")
+    parser.add_argument("-D", "--debug", action="store_true")
+
+    # Accept password command line (as previously done) or via getpass
+    parser_pass = parser.add_mutually_exclusive_group(required=True)
+    parser_pass.add_argument('-p', '--password')
+    parser_pass.add_argument('-P', '--prompt-pass', action="store_true",
+            help="Prompt for password")
+
     args = parser.parse_args()
-    c = Content()
-    c.id = Conferences[args.conference]
-    c.name = args.conference
-    cli = Client(username=args.username, password=args.password)
-    cookies = cli.login()
-    videos = cli.get_playlist(c, cookies=cookies)
-    for video in videos:
-        cli.get_video(video, args.outpath, cookies=cookies)
+
+    if args.prompt_pass:
+        password = getpass.getpass()
+    else:
+        password = args.password
+
+    for conference_name in args.conferences:
+        logger.info("[*] Start processing conference: %s", conference_name)
+        conference_dir = os.path.join(args.output_dir, conference_name)
+        if not os.path.exists(conference_dir):
+            os.mkdir(conference_dir)
+        c = Content()
+        c.id = ConferenceIds[conference_name]
+        c.name = conference_name
+        cli = Client(
+                username=args.username,
+                password=password,
+                directory=conference_dir,
+                delay=args.delay,
+                debug=args.debug)
+        cli.login()
+        videos = cli.get_playlist(c)
+        for video in videos:
+            cli.get_video(video)
+
+            if args.delay > 0:
+                logger.info('Sleeping for %d sec(s)', args.delay)
+                time.sleep(args.delay)
+        logger.info("[^] Done downloading for conference: %s", conference_name)
+
 
 if __name__ == '__main__':
     main()
