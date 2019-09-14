@@ -16,10 +16,13 @@ ConferenceIds = {
     "DEFCON24": 32,
     "DEFCON25": 41,
     "DEFCON26": 54,
+    "DEFCON27": 71,
+    "DEFCON27-VILLAGE": 72,
     "DEFCON26-VILLAGE": 67,
     "BSidesLV2016": 39,
     "BlackHatUSA2017": 40,
     "BlackHatUSA2018": 53,
+    "BlackHatUSA2019": 70,
 }
 AllowedChoices = ConferenceIds.keys()
 
@@ -105,7 +108,7 @@ class Client:
             logger.error("[!] Failed to get stream for: {title}".format(title=video.name))
             return
         with open(dl_path, 'wb') as fh:
-            for chunk in stream.iter_content(chunk_size=1024):
+            for chunk in stream.iter_content(chunk_size=4096):
                 fh.write(chunk)
         logger.info("[*] Downloaded video: %s to %s", video.name, dl_path)
         return dl_path
@@ -175,11 +178,17 @@ def main():
         cli.login()
         videos = cli.get_playlist(c)
         for video in videos:
-            cli.get_video(video)
-
-            if args.delay > 0:
-                logger.info('Sleeping for %d sec(s)', args.delay)
-                time.sleep(args.delay)
+            for retries in range(3):
+                try:
+                    cli.get_video(video)
+                    break
+                except Exception as error:
+                    logger.info('Error trying to download: %s, on retry %d',
+                            str(error), retries)
+                finally:
+                    if args.delay > 0:
+                        logger.info('Sleeping for %d sec(s)', args.delay)
+                        time.sleep(args.delay)
         logger.info("[^] Done downloading for conference: %s", conference_name)
 
 
